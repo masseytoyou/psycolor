@@ -159,7 +159,7 @@ def validate_scores(index_scores: Dict[str, int], subtest_scores: Dict[str, int]
 
 
 # ---------------- UI ----------------
-st.title("🧠 Psycolar 보고서 생성기")
+st.title("🧠 Psycolor 보고서 생성기")
 st.caption("룩업 테이블 + OpenAI API로 아주 간단하게 결과 문단을 생성하는 테스트용 화면")
 
 with st.expander("사용 전 확인", expanded=True):
