@@ -148,6 +148,7 @@ def build_prompt(
 
     lines.append("")
     lines.append("위 정보를 바탕으로 전체 결과를 3000자 이내의 자연스러운 한국어 보고서 문단 2개로 작성하라. 첫 번째 문단은 지표(index) 결과 중심, 두 번째 문단은 소검사(subtest) 결과 중심으로 작성하라.")
+    lines.append("단, '***'과 같은 기호는 사용하지 말 것.")
     return "\n".join(lines)
 
 
