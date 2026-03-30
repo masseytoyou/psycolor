@@ -135,14 +135,8 @@ def build_prompt(
     lines.append("진단명이나 치료 권고를 임의로 추가하지 마라.")
     lines.append("공식적이고 자연스러운 한국어 보고서 문체로 작성하라.")
     lines.append(f"검사 유형은 {test_type}이다.")
-    lines.append("")
-
-    lines.append("[수검자 정보]")
-    for k, v in examinee_info.items():
-        if str(v).strip():
-            lines.append(f"- {k}: {v}")
-
-    lines.append("")
+    lines.append("지표 결과와 소검사 결과는 각각 다른 문단으로 작성하라.")
+    lines.append("")    
     lines.append("[지표 결과]")
     for key, value in index_cla_com.items():
         cla, com = next(iter(value.items()))
@@ -155,7 +149,7 @@ def build_prompt(
         lines.append(f"- {key}: {cla} / {com}")
 
     lines.append("")
-    lines.append("위 정보를 바탕으로 전체 결과를 5~8문장의 자연스러운 한국어 보고서 문단 1개로 작성하라.")
+    lines.append("위 정보를 바탕으로 전체 결과를 5~8문장의 자연스러운 한국어 보고서 문단 2개로 작성하라. 첫 번째 문단은 지표(index) 결과 중심, 두 번째 문단은 소검사(subtest) 결과 중심으로 작성하라.")
     return "\n".join(lines)
 
 
@@ -197,28 +191,55 @@ def make_pdf_bytes(title: str, lines: List[str]) -> bytes:
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
 
-    # 한글 표시용 기본 CID 폰트
     pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
-    c.setFont("HYSMyeongJo-Medium", 11)
 
     width, height = A4
-    x = 50
-    y = height - 50
+    left_margin = 50
+    top_margin = 50
+    bottom_margin = 50
+    y = height - top_margin
     line_height = 18
+    usable_width = width - (left_margin * 2)
+
+    def wrap_text(text: str, font_name: str, font_size: int, max_width: float) -> List[str]:
+        text = str(text)
+        if not text:
+            return [""]
+
+        wrapped_lines: List[str] = []
+        current = ""
+
+        for ch in text:
+            trial = current + ch
+            if pdfmetrics.stringWidth(trial, font_name, font_size) <= max_width:
+                current = trial
+            else:
+                if current:
+                    wrapped_lines.append(current)
+                current = ch
+
+        if current:
+            wrapped_lines.append(current)
+
+        return wrapped_lines or [""]
 
     c.setFont("HYSMyeongJo-Medium", 14)
-    c.drawString(x, y, title)
+    c.drawString(left_margin, y, title)
     y -= 30
 
     c.setFont("HYSMyeongJo-Medium", 11)
-    for line in lines:
-        if y < 50:
-            c.showPage()
-            c.setFont("HYSMyeongJo-Medium", 11)
-            y = height - 50
+    for raw_line in lines:
+        split_lines = str(raw_line).splitlines() or [""]
+        for split_line in split_lines:
+            wrapped = wrap_text(split_line, "HYSMyeongJo-Medium", 11, usable_width)
+            for line in wrapped:
+                if y < bottom_margin:
+                    c.showPage()
+                    c.setFont("HYSMyeongJo-Medium", 11)
+                    y = height - top_margin
 
-        c.drawString(x, y, str(line)[:100])
-        y -= line_height
+                c.drawString(left_margin, y, line)
+                y -= line_height
 
     c.save()
     pdf_bytes = buffer.getvalue()
@@ -526,9 +547,6 @@ with st.expander("사용 전 확인", expanded=True):
     st.markdown(
         """
 - 이 화면은 MVP 테스트용입니다.
-- 흐름: 수검자 정보 입력 → 점수 입력 → 룩업 매핑 → 보고서 생성 → DB 누적 저장
-- 앱을 다시 켜도 `psycolor.db` 파일이 남아 있으면 데이터는 유지됩니다.
-- 다만 Streamlit Cloud 같은 환경은 로컬 파일 영속성이 약할 수 있습니다.
         """
     )
 
@@ -585,12 +603,6 @@ with left:
 
     generate_clicked = st.button("보고서 생성 및 저장", type="primary", use_container_width=True)
 
-with right:
-    st.subheader("중간 결과")
-    st.write("수검자 정보", examinee_info)
-    st.write("입력된 지표점수", index_scores)
-    st.write("입력된 소검사점수", subtest_scores)
-
 
 if generate_clicked:
     if not index_scores and not subtest_scores:
@@ -616,7 +628,7 @@ if generate_clicked:
     st.code(prompt, language="text")
 
     try:
-        with st.spinner("AI가 보고서를 생성하는 중입니다..."):
+        with st.spinner("보고서를 생성하는 중입니다..."):
             final_report = generate_report(prompt)
 
         saved_test_id = save_test_run(
@@ -804,29 +816,3 @@ with st.expander("룩업 테이블 미리보기"):
     index_df, subtest_df = get_test_frames(test_type)
     st.write("지표 테이블", index_df.head())
     st.write("소검사 테이블", subtest_df.head())
-
-
-# =========================
-# DB 파일 안내
-# =========================
-with st.expander("DB 파일 안내 / 열어보는 방법"):
-    st.markdown(f"""
-현재 앱은 `{DB_PATH}` 파일에 SQLite로 저장합니다.
-
-로컬에서 열어보는 방법 예시
-
-1. DB 파일 위치 확인  
-- 이 코드 파일과 같은 폴더에 `{DB_PATH}`가 생성됩니다.
-
-2. Python으로 확인
-```python
-import sqlite3
-import pandas as pd
-
-conn = sqlite3.connect("psycolor.db")
-
-print(pd.read_sql_query("SELECT * FROM test_run", conn))
-print(pd.read_sql_query("SELECT * FROM test_result", conn))
-print(pd.read_sql_query("SELECT * FROM final_report", conn))
-
-conn.close()""")
