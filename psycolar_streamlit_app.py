@@ -178,9 +178,8 @@ def validate_scores(index_scores: Dict[str, int], subtest_scores: Dict[str, int]
     return errors
 
 
-# =========================
 # PDF/TXT/CSV 유틸
-# =========================
+
 def make_txt_bytes(text: str) -> bytes:
     return text.encode("utf-8")
 
@@ -655,162 +654,74 @@ if generate_clicked:
 
 
 # 저장 이력 조회 / 재생성 / 삭제 / 다운로드
-st.divider()
-st.subheader("저장된 검사 이력")
+if generate_clicked:
+    if not index_scores and not subtest_scores:
+        st.error("최소 1개 이상의 점수를 입력해주세요.")
+        st.stop()
 
-try:
-    history_df = load_test_runs(limit=50)
+    errors = validate_scores(index_scores, subtest_scores)
+    if errors:
+        for err in errors:
+            st.error(err)
+        st.stop()
 
-    if history_df.empty:
-        st.info("아직 저장된 검사 이력이 없습니다.")
-    else:
-        st.dataframe(history_df, use_container_width=True)
+    index_cla_com = put_index_cla_and_com(test_type, index_scores)
+    subtest_cla_com = put_subtest_cla_and_com(test_type, subtest_scores)
+    prompt = build_prompt(test_type, index_cla_com, subtest_cla_com, examinee_info)
 
-        st.download_button(
-            label="전체 이력 CSV 다운로드",
-            data=dataframe_to_csv_bytes(history_df),
-            file_name="psycolor_history.csv",
-            mime="text/csv",
-            use_container_width=True,
+    try:
+        with st.spinner("보고서를 생성하는 중입니다..."):
+            final_report = generate_report(prompt)
+
+        saved_test_id = save_test_run(
+            test_type=test_type,
+            examinee_info=examinee_info,
+            index_scores=index_scores,
+            subtest_scores=subtest_scores,
+            index_cla_com=index_cla_com,
+            subtest_cla_com=subtest_cla_com,
+            prompt=prompt,
+            final_report=final_report,
+            model_name=MODEL_NAME,
         )
 
-        test_id_options = history_df["test_id"].tolist()
-        selected_test_id = st.selectbox("상세 조회할 test_id 선택", test_id_options)
+        st.subheader("최종 보고서")
+        st.text_area(
+            "생성 결과",
+            final_report,
+            height=260,
+            key=f"new_report_{saved_test_id}",
+        )
+        st.success("보고서가 저장되었습니다.")
 
-        if selected_test_id:
-            run_df, result_df, report_df = load_test_detail(selected_test_id)
+        txt_content = "\n".join([
+            "[최종 보고서]",
+            final_report,
+        ])
 
-            st.markdown("### 검사 기본 정보")
-            st.dataframe(run_df, use_container_width=True)
+        pdf_lines = final_report.splitlines()
 
-            st.markdown("### 항목별 결과")
-            st.dataframe(result_df, use_container_width=True)
+        col_dl1, col_dl2 = st.columns(2)
 
+        with col_dl1:
             st.download_button(
-                label="이 검사 결과 CSV 다운로드",
-                data=dataframe_to_csv_bytes(result_df),
-                file_name=f"{selected_test_id}_results.csv",
-                mime="text/csv",
+                label="보고서 TXT 다운로드",
+                data=make_txt_bytes(txt_content),
+                file_name="psycolor_report.txt",
+                mime="text/plain",
                 use_container_width=True,
-                key=f"csv_download_{selected_test_id}",
+                key=f"txt_download_new_{saved_test_id}",
             )
 
-            st.markdown("### 최종 보고서")
-            if not report_df.empty:
-                saved_report = str(report_df.iloc[0]["final_report"])
-                saved_prompt = str(report_df.iloc[0]["prompt"])
-                saved_model = str(report_df.iloc[0]["model_name"])
+        with col_dl2:
+            st.download_button(
+                label="보고서 PDF 다운로드",
+                data=make_pdf_bytes("Psycolor Report", pdf_lines),
+                file_name="psycolor_report.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"pdf_download_new_{saved_test_id}",
+            )
 
-                st.write("모델명:", saved_model)
-                st.text_area(
-                    "저장된 보고서",
-                    saved_report,
-                    height=250,
-                    key=f"saved_report_{selected_test_id}",
-                )
-
-                with st.expander("저장된 프롬프트 보기"):
-                    st.code(saved_prompt, language="text")
-
-                txt_content = "\n".join([
-                    f"test_id: {selected_test_id}",
-                    "",
-                    "[최종 보고서]",
-                    saved_report
-                ])
-
-                pdf_lines = [
-                    f"test_id: {selected_test_id}",
-                    ""
-                ] + saved_report.splitlines()
-
-                col_dl1, col_dl2 = st.columns(2)
-                with col_dl1:
-                    st.download_button(
-                        label="보고서 TXT 다운로드",
-                        data=make_txt_bytes(txt_content),
-                        file_name=f"{selected_test_id}_report.txt",
-                        mime="text/plain",
-                        use_container_width=True,
-                        key=f"txt_download_{selected_test_id}",
-                    )
-                with col_dl2:
-                    st.download_button(
-                        label="보고서 PDF 다운로드",
-                        data=make_pdf_bytes("Psycolor Report", pdf_lines),
-                        file_name=f"{selected_test_id}_report.pdf",
-                        mime="application/pdf",
-                        use_container_width=True,
-                        key=f"pdf_download_{selected_test_id}",
-                    )
-
-                st.markdown("### 보고서 재생성 / 삭제")
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    if st.button("선택한 검사 보고서 재생성", key=f"regen_{selected_test_id}", use_container_width=True):
-                        run_row = run_df.iloc[0].to_dict()
-                        index_scores_db, subtest_scores_db = get_scores_from_result_df(result_df)
-
-                        test_type_db = str(run_row["test_type"])
-                        examinee_info_db = {
-                            "이름": str(run_row.get("examinee_name", "") or ""),
-                            "생년월일": str(run_row.get("date_of_birth", "") or ""),
-                            "성별": str(run_row.get("sex", "") or ""),
-                            "검사자": str(run_row.get("examiner", "") or ""),
-                            "검사일": str(run_row.get("test_date", "") or ""),
-                        }
-
-                        index_cla_com_db = put_index_cla_and_com(test_type_db, index_scores_db)
-                        subtest_cla_com_db = put_subtest_cla_and_com(test_type_db, subtest_scores_db)
-                        new_prompt = build_prompt(
-                            test_type_db,
-                            index_cla_com_db,
-                            subtest_cla_com_db,
-                            examinee_info_db,
-                        )
-
-                        try:
-                            with st.spinner("선택한 보고서를 다시 생성하는 중입니다..."):
-                                new_report = generate_report(new_prompt)
-
-                            update_final_report(
-                                test_id=selected_test_id,
-                                prompt=new_prompt,
-                                final_report=new_report,
-                                model_name=MODEL_NAME,
-                            )
-
-                            st.success("보고서 재생성 및 DB 업데이트 완료")
-                            st.rerun()
-
-                        except Exception as e:
-                            st.error(f"재생성 중 오류가 발생했습니다: {e}")
-
-                with col2:
-                    delete_confirm = st.checkbox(
-                        "삭제 확인",
-                        key=f"delete_confirm_{selected_test_id}"
-                    )
-
-                    if st.button("선택한 검사 삭제", key=f"delete_{selected_test_id}", use_container_width=True):
-                        if not delete_confirm:
-                            st.warning("삭제 확인 체크를 먼저 해주세요.")
-                        else:
-                            try:
-                                delete_test_run(selected_test_id)
-                                st.success("검사 데이터 삭제 완료")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"삭제 중 오류가 발생했습니다: {e}")
-
-except Exception as e:
-    st.error(f"저장 이력 조회 중 오류가 발생했습니다: {e}")
-
-
-# 하단 디버그용
-with st.expander("룩업 테이블 미리보기"):
-    index_df, subtest_df = get_test_frames(test_type)
-    st.write("지표 테이블", index_df.head())
-    st.write("소검사 테이블", subtest_df.head())
+    except Exception as e:
+        st.error(f"생성 중 오류가 발생했습니다: {e}")
