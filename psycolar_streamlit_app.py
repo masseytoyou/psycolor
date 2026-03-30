@@ -1,11 +1,11 @@
 import os
-import sqlite3
 import uuid
 from datetime import datetime
-from io import BytesIO, StringIO
+from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import psycopg2
 import streamlit as st
 from openai import OpenAI
 from reportlab.lib.pagesizes import A4
@@ -22,8 +22,6 @@ INDEX_CSV_URL = "https://docs.google.com/spreadsheets/d/1rAgPIi_o0NsBfF89wAbUr3h
 SUBTEST_CSV_URL = "https://docs.google.com/spreadsheets/d/1rAgPIi_o0NsBfF89wAbUr3hwg0PX2w115twdyW9p2BQ/export?format=csv&gid=978787284"
 
 MODEL_NAME = "gpt-4o-mini"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "psycolor.db")
 
 SELECTION = {
     "K-WPPSI-IV_A": {
@@ -137,7 +135,7 @@ def build_prompt(
     lines.append("공식적이고 자연스러운 한국어 보고서 문체로 작성하라.")
     lines.append(f"검사 유형은 {test_type}이다.")
     lines.append("지표 결과와 소검사 결과는 각각 다른 문단으로 작성하라.")
-    lines.append("")    
+    lines.append("")
     lines.append("[지표 결과]")
     for key, value in index_cla_com.items():
         cla, com = next(iter(value.items()))
@@ -253,26 +251,42 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # =========================
-# SQLite DB 유틸
+# PostgreSQL DB 유틸
 # =========================
-def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+def get_db_url() -> str:
+    env_url = os.getenv("DATABASE_URL")
+    if env_url:
+        return env_url
+
+    try:
+        return st.secrets["DATABASE_URL"]
+    except Exception:
+        raise ValueError("DATABASE_URL이 설정되지 않았습니다.")
 
 
-def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+def get_connection():
+    return psycopg2.connect(get_db_url())
+
+
+def column_exists(conn, table_name: str, column_name: str) -> bool:
+    query = """
+    SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (table_name, column_name))
+        return cur.fetchone()[0]
+
+
+def init_db() -> None:
+    conn = get_connection()
     cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table_name})")
-    cols = [row[1] for row in cur.fetchall()]
-    return column_name in cols
 
-
-def init_db(db_path: str = DB_PATH) -> None:
-    conn = get_connection(db_path)
-    cur = conn.cursor()
-
-    # 처음부터 최신 구조로 생성
     cur.execute("""
     CREATE TABLE IF NOT EXISTS test_run (
         test_id TEXT PRIMARY KEY,
@@ -288,30 +302,31 @@ def init_db(db_path: str = DB_PATH) -> None:
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS test_result (
-        result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        result_id BIGSERIAL PRIMARY KEY,
         test_id TEXT NOT NULL,
         result_type TEXT NOT NULL,
         result_name TEXT NOT NULL,
         raw_score INTEGER NOT NULL,
         classification TEXT NOT NULL,
         comment TEXT NOT NULL,
-        FOREIGN KEY (test_id) REFERENCES test_run(test_id) ON DELETE CASCADE
+        CONSTRAINT fk_test_result_test_run
+            FOREIGN KEY (test_id) REFERENCES test_run(test_id) ON DELETE CASCADE
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS final_report (
-        report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id BIGSERIAL PRIMARY KEY,
         test_id TEXT NOT NULL UNIQUE,
         prompt TEXT,
         final_report TEXT NOT NULL,
         model_name TEXT,
         created_at TEXT NOT NULL,
-        FOREIGN KEY (test_id) REFERENCES test_run(test_id) ON DELETE CASCADE
+        CONSTRAINT fk_final_report_test_run
+            FOREIGN KEY (test_id) REFERENCES test_run(test_id) ON DELETE CASCADE
     )
     """)
 
-    # 예전 DB 파일이 이미 있을 때 컬럼 추가 보정
     required_columns = {
         "examinee_name": "TEXT",
         "date_of_birth": "TEXT",
@@ -325,6 +340,7 @@ def init_db(db_path: str = DB_PATH) -> None:
             cur.execute(f"ALTER TABLE test_run ADD COLUMN {col_name} {col_type}")
 
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -338,19 +354,18 @@ def save_test_run(
     prompt: str,
     final_report: str,
     model_name: str = MODEL_NAME,
-    db_path: str = DB_PATH,
 ) -> str:
     test_id = uuid.uuid4().hex
     now = datetime.now().isoformat(timespec="seconds")
 
-    conn = get_connection(db_path)
+    conn = get_connection()
     cur = conn.cursor()
 
     try:
         cur.execute("""
         INSERT INTO test_run (
             test_id, test_type, examinee_name, date_of_birth, sex, examiner, test_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             test_id,
             test_type,
@@ -371,7 +386,7 @@ def save_test_run(
             cur.execute("""
             INSERT INTO test_result (
                 test_id, result_type, result_name, raw_score, classification, comment
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 test_id,
                 "index",
@@ -390,7 +405,7 @@ def save_test_run(
             cur.execute("""
             INSERT INTO test_result (
                 test_id, result_type, result_name, raw_score, classification, comment
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 test_id,
                 "subtest",
@@ -403,7 +418,7 @@ def save_test_run(
         cur.execute("""
         INSERT INTO final_report (
             test_id, prompt, final_report, model_name, created_at
-        ) VALUES (?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s)
         """, (
             test_id,
             prompt,
@@ -419,11 +434,12 @@ def save_test_run(
         conn.rollback()
         raise
     finally:
+        cur.close()
         conn.close()
 
 
-def load_test_runs(limit: int = 50, db_path: str = DB_PATH) -> pd.DataFrame:
-    conn = get_connection(db_path)
+def load_test_runs(limit: int = 50) -> pd.DataFrame:
+    conn = get_connection()
     query = """
     SELECT
         tr.test_id,
@@ -439,20 +455,20 @@ def load_test_runs(limit: int = 50, db_path: str = DB_PATH) -> pd.DataFrame:
     LEFT JOIN final_report fr
         ON tr.test_id = fr.test_id
     ORDER BY tr.created_at DESC
-    LIMIT ?
+    LIMIT %s
     """
     df = pd.read_sql_query(query, conn, params=(limit,))
     conn.close()
     return df
 
 
-def load_test_detail(test_id: str, db_path: str = DB_PATH):
-    conn = get_connection(db_path)
+def load_test_detail(test_id: str):
+    conn = get_connection()
 
     run_df = pd.read_sql_query("""
     SELECT *
     FROM test_run
-    WHERE test_id = ?
+    WHERE test_id = %s
     """, conn, params=(test_id,))
 
     result_df = pd.read_sql_query("""
@@ -463,7 +479,7 @@ def load_test_detail(test_id: str, db_path: str = DB_PATH):
         classification,
         comment
     FROM test_result
-    WHERE test_id = ?
+    WHERE test_id = %s
     ORDER BY
         CASE result_type
             WHEN 'index' THEN 1
@@ -480,7 +496,7 @@ def load_test_detail(test_id: str, db_path: str = DB_PATH):
         model_name,
         created_at
     FROM final_report
-    WHERE test_id = ?
+    WHERE test_id = %s
     """, conn, params=(test_id,))
 
     conn.close()
@@ -505,36 +521,35 @@ def update_final_report(
     prompt: str,
     final_report: str,
     model_name: str = MODEL_NAME,
-    db_path: str = DB_PATH,
 ) -> None:
-    conn = get_connection(db_path)
+    conn = get_connection()
     cur = conn.cursor()
     now = datetime.now().isoformat(timespec="seconds")
 
     cur.execute("""
     UPDATE final_report
-    SET prompt = ?, final_report = ?, model_name = ?, created_at = ?
-    WHERE test_id = ?
+    SET prompt = %s, final_report = %s, model_name = %s, created_at = %s
+    WHERE test_id = %s
     """, (prompt, final_report, model_name, now, test_id))
 
     conn.commit()
+    cur.close()
     conn.close()
 
 
-def delete_test_run(test_id: str, db_path: str = DB_PATH) -> None:
-    conn = get_connection(db_path)
+def delete_test_run(test_id: str) -> None:
+    conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("DELETE FROM test_run WHERE test_id = ?", (test_id,))
+    cur.execute("DELETE FROM test_run WHERE test_id = %s", (test_id,))
     conn.commit()
+    cur.close()
     conn.close()
 
 
 # =========================
 # DB 생성
 # =========================
-# 이 함수는 기존 데이터를 지우지 않음.
-# DB 파일이 없으면 만들고, 있으면 유지한 채 테이블만 점검함.
 init_db()
 
 
@@ -542,7 +557,7 @@ init_db()
 # UI
 # =========================
 st.title("🧠 Psycolor 보고서 생성기")
-st.caption("룩업 테이블 + OpenAI API + SQLite 누적 저장 버전")
+st.caption("룩업 테이블 + OpenAI API + PostgreSQL 누적 저장 버전")
 
 with st.expander("사용 전 확인", expanded=True):
     st.markdown(
@@ -666,7 +681,6 @@ try:
     else:
         st.dataframe(history_df, use_container_width=True)
 
-        # 전체 이력 CSV 다운로드
         st.download_button(
             label="전체 이력 CSV 다운로드",
             data=dataframe_to_csv_bytes(history_df),
@@ -817,7 +831,3 @@ with st.expander("룩업 테이블 미리보기"):
     index_df, subtest_df = get_test_frames(test_type)
     st.write("지표 테이블", index_df.head())
     st.write("소검사 테이블", subtest_df.head())
-
-import os
-print("현재 작업 경로:", os.getcwd())
-print("DB 절대 경로:", os.path.abspath("psycolor.db"))
