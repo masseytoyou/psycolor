@@ -628,47 +628,6 @@ if generate_clicked:
     subtest_cla_com = put_subtest_cla_and_com(test_type, subtest_scores)
     prompt = build_prompt(test_type, index_cla_com, subtest_cla_com, examinee_info)
 
-
-    try:
-        with st.spinner("보고서를 생성하는 중입니다..."):
-            final_report = generate_report(prompt)
-
-        saved_test_id = save_test_run(
-            test_type=test_type,
-            examinee_info=examinee_info,
-            index_scores=index_scores,
-            subtest_scores=subtest_scores,
-            index_cla_com=index_cla_com,
-            subtest_cla_com=subtest_cla_com,
-            prompt=prompt,
-            final_report=final_report,
-            model_name=MODEL_NAME,
-        )
-
-        st.subheader("최종 보고서")
-        st.text_area("생성 결과", final_report, height=260, key=f"new_report_{saved_test_id}")
-        st.success(f"DB 저장 완료: {saved_test_id}")
-
-    except Exception as e:
-        st.error(f"생성 중 오류가 발생했습니다: {e}")
-
-
-# 저장 이력 조회 / 재생성 / 삭제 / 다운로드
-if generate_clicked:
-    if not index_scores and not subtest_scores:
-        st.error("최소 1개 이상의 점수를 입력해주세요.")
-        st.stop()
-
-    errors = validate_scores(index_scores, subtest_scores)
-    if errors:
-        for err in errors:
-            st.error(err)
-        st.stop()
-
-    index_cla_com = put_index_cla_and_com(test_type, index_scores)
-    subtest_cla_com = put_subtest_cla_and_com(test_type, subtest_scores)
-    prompt = build_prompt(test_type, index_cla_com, subtest_cla_com, examinee_info)
-
     try:
         with st.spinner("보고서를 생성하는 중입니다..."):
             final_report = generate_report(prompt)
