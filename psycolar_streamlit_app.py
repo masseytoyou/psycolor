@@ -21,8 +21,9 @@ st.set_page_config(page_title="Psycolor 보고서 생성기", page_icon="🧠", 
 INDEX_CSV_URL = "https://docs.google.com/spreadsheets/d/1rAgPIi_o0NsBfF89wAbUr3hwg0PX2w115twdyW9p2BQ/export?format=csv&gid=0"
 SUBTEST_CSV_URL = "https://docs.google.com/spreadsheets/d/1rAgPIi_o0NsBfF89wAbUr3hwg0PX2w115twdyW9p2BQ/export?format=csv&gid=978787284"
 
-MODEL_NAME = "gpt-5-mini"
-DB_PATH = "psycolor.db"
+MODEL_NAME = "gpt-4o-mini"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "psycolor.db")
 
 SELECTION = {
     "K-WPPSI-IV_A": {
@@ -816,3 +817,7 @@ with st.expander("룩업 테이블 미리보기"):
     index_df, subtest_df = get_test_frames(test_type)
     st.write("지표 테이블", index_df.head())
     st.write("소검사 테이블", subtest_df.head())
+
+import os
+print("현재 작업 경로:", os.getcwd())
+print("DB 절대 경로:", os.path.abspath("psycolor.db"))
