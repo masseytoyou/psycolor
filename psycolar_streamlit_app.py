@@ -54,9 +54,8 @@ SELECTION = {
 }
 
 
-# =========================
 # OpenAI / Lookup 유틸
-# =========================
+
 def get_api_key() -> Optional[str]:
     env_key = os.getenv("OPENAI_API_KEY")
     if env_key:
@@ -148,7 +147,7 @@ def build_prompt(
         lines.append(f"- {key}: {cla} / {com}")
 
     lines.append("")
-    lines.append("위 정보를 바탕으로 전체 결과를 5~8문장의 자연스러운 한국어 보고서 문단 2개로 작성하라. 첫 번째 문단은 지표(index) 결과 중심, 두 번째 문단은 소검사(subtest) 결과 중심으로 작성하라.")
+    lines.append("위 정보를 바탕으로 전체 결과를 3000자 이내의 자연스러운 한국어 보고서 문단 2개로 작성하라. 첫 번째 문단은 지표(index) 결과 중심, 두 번째 문단은 소검사(subtest) 결과 중심으로 작성하라.")
     return "\n".join(lines)
 
 
@@ -250,9 +249,8 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-# =========================
 # PostgreSQL DB 유틸
-# =========================
+
 def get_db_url() -> str:
     env_url = os.getenv("DATABASE_URL")
     if env_url:
@@ -547,19 +545,15 @@ def delete_test_run(test_id: str) -> None:
     conn.close()
 
 
-# =========================
 # DB 생성
-# =========================
 init_db()
 
 
-# =========================
 # UI
-# =========================
-st.title("🧠 Psycolor 보고서 생성기")
-st.caption("룩업 테이블 + OpenAI API + PostgreSQL 누적 저장 버전")
 
-with st.expander("사용 전 확인", expanded=True):
+st.title("🧠 Psycolor 보고서 생성기")
+
+with st.expander("안내 사항", expanded=True):
     st.markdown(
         """
 - 이 화면은 MVP 테스트용입니다.
@@ -571,10 +565,10 @@ left, right = st.columns([1, 1])
 with left:
     st.subheader("수검자 정보")
     examinee_name = st.text_input("이름")
-    date_of_birth = st.text_input("생년월일", placeholder="예: 2018-03-21")
+    date_of_birth = st.text_input("생년월일")
     sex = st.selectbox("성별", options=["", "남", "여", "기타"])
     examiner = st.text_input("검사자")
-    test_date = st.text_input("검사일", placeholder="예: 2026-03-30")
+    test_date = st.text_input("검사일")
 
     examinee_info = {
         "이름": examinee_name,
@@ -596,7 +590,7 @@ with left:
             max_value=200,
             value=None,
             step=1,
-            placeholder="비워두면 입력 안 함",
+            placeholder="지표 검사 미시행시 건너뛰기",
             key=f"index_{test_type}_{index_code}",
         )
         if value is not None:
@@ -611,7 +605,7 @@ with left:
             max_value=19,
             value=None,
             step=1,
-            placeholder="비워두면 입력 안 함",
+            placeholder="소검사 미시행시 건너뛰기",
             key=f"subtest_{test_type}_{subtest_code}",
         )
         if value is not None:
@@ -635,13 +629,6 @@ if generate_clicked:
     subtest_cla_com = put_subtest_cla_and_com(test_type, subtest_scores)
     prompt = build_prompt(test_type, index_cla_com, subtest_cla_com, examinee_info)
 
-    st.divider()
-    st.subheader("룩업 매핑 결과")
-    st.write("지표 분류/코멘트", index_cla_com)
-    st.write("소검사 분류/코멘트", subtest_cla_com)
-
-    st.subheader("생성 프롬프트")
-    st.code(prompt, language="text")
 
     try:
         with st.spinner("보고서를 생성하는 중입니다..."):
@@ -667,9 +654,7 @@ if generate_clicked:
         st.error(f"생성 중 오류가 발생했습니다: {e}")
 
 
-# =========================
 # 저장 이력 조회 / 재생성 / 삭제 / 다운로드
-# =========================
 st.divider()
 st.subheader("저장된 검사 이력")
 
@@ -824,9 +809,7 @@ except Exception as e:
     st.error(f"저장 이력 조회 중 오류가 발생했습니다: {e}")
 
 
-# =========================
 # 하단 디버그용
-# =========================
 with st.expander("룩업 테이블 미리보기"):
     index_df, subtest_df = get_test_frames(test_type)
     st.write("지표 테이블", index_df.head())
