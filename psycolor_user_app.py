@@ -404,11 +404,11 @@ def ensure_users_table(conn) -> None:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGSERIAL PRIMARY KEY,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('general', 'senior', 'expert', 'admin')),
-            nickname TEXT UNIQUE,
-            created_at TEXT NOT NULL
+            username TEXT,
+            password_hash TEXT,
+            role TEXT,
+            nickname TEXT,
+            created_at TEXT
         )
         """)
 
@@ -423,14 +423,14 @@ def ensure_users_table(conn) -> None:
             if not column_exists(conn, "users", col_name):
                 cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
 
+        cur.execute("UPDATE users SET created_at = COALESCE(created_at, %s)", (now_str(),))
+        cur.execute("UPDATE users SET role = COALESCE(role, 'general')")
+
         cur.execute("ALTER TABLE users ALTER COLUMN username SET NOT NULL")
         cur.execute("ALTER TABLE users ALTER COLUMN password_hash SET NOT NULL")
         cur.execute("ALTER TABLE users ALTER COLUMN role SET NOT NULL")
         cur.execute("ALTER TABLE users ALTER COLUMN created_at SET NOT NULL")
         cur.execute("ALTER TABLE users ALTER COLUMN nickname DROP NOT NULL")
-
-        cur.execute("UPDATE users SET created_at = COALESCE(created_at, %s)", (now_str(),))
-        cur.execute("UPDATE users SET role = COALESCE(role, 'general')")
 
         cur.execute(
             """
@@ -450,12 +450,16 @@ def ensure_users_table(conn) -> None:
         )
 
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique ON users(username)")
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nickname_unique ON users(nickname)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nickname_unique ON users(nickname) WHERE nickname IS NOT NULL")
 
 
 def init_db() -> None:
     conn = get_connection()
+    lock_key = 20260331
     try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+
         ensure_users_table(conn)
 
         with conn.cursor() as cur:
@@ -570,6 +574,11 @@ def init_db() -> None:
         conn.rollback()
         raise
     finally:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+        except Exception:
+            pass
         conn.close()
 
 
