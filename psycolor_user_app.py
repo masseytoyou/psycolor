@@ -1,3 +1,4 @@
+
 import os
 import uuid
 import hashlib
@@ -94,16 +95,6 @@ def get_db_url() -> str:
         raise ValueError("DATABASE_URL이 설정되지 않았습니다.")
 
 
-def get_admin_signup_code() -> str:
-    env_code = os.getenv("ADMIN_SIGNUP_CODE")
-    if env_code:
-        return env_code
-    try:
-        return st.secrets["ADMIN_SIGNUP_CODE"]
-    except Exception:
-        return "change-this-admin-code"
-
-
 def get_connection():
     return psycopg2.connect(get_db_url())
 
@@ -167,6 +158,18 @@ def logout() -> None:
         if key in st.session_state:
             del st.session_state[key]
     init_session_state()
+
+
+def normalize_binary_data(value):
+    if value is None:
+        return None
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, bytes):
+        return value
+    return None
 
 
 # =========================================================
@@ -245,7 +248,6 @@ def build_prompt(
     for k, v in examinee_info.items():
         if safe_text(v):
             lines.append(f"- {k}: {safe_text(v)}")
-
     lines.append("")
     lines.append("[지표 결과]")
     for key, value in index_cla_com.items():
@@ -757,36 +759,8 @@ def save_test_run(
         conn.close()
 
 
-def load_generated_reports(limit: int = 100) -> pd.DataFrame:
-    conn = get_connection()
-    query = """
-    SELECT
-        tr.test_id,
-        tr.test_type,
-        tr.examinee_name,
-        tr.date_of_birth,
-        tr.sex,
-        tr.examiner,
-        tr.test_date,
-        COALESCE(u.nickname, u.username, '-') AS created_by,
-        fr.model_name,
-        fr.created_at,
-        LEFT(fr.final_report, 120) AS preview
-    FROM test_run tr
-    LEFT JOIN final_report fr
-        ON tr.test_id = fr.test_id
-    LEFT JOIN users u
-        ON tr.expert_user_id = u.user_id
-    ORDER BY fr.created_at DESC NULLS LAST
-    LIMIT %s
-    """
-    df = pd.read_sql_query(query, conn, params=(limit,))
-    conn.close()
-    return df
-
-
 # =========================================================
-# 커뮤니티
+# 커뮤니티 / 메일
 # =========================================================
 def create_post(
     board_type: str,
@@ -797,17 +771,15 @@ def create_post(
     image_name: Optional[str],
     image_mime: Optional[str],
 ) -> None:
+    approval_status = "approved" if board_type == "anonymous" else "pending"
+
     conn = get_connection()
     cur = conn.cursor()
-
-    approval_status = "approved" if board_type == "anonymous" else "pending"
-    approved_at = now_str() if board_type == "anonymous" else None
-
     cur.execute("""
     INSERT INTO community_post (
         board_type, author_user_id, title, content, image_bytes, image_name, image_mime,
-        approval_status, approved_at, created_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        approval_status, created_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         board_type,
         author_user_id,
@@ -817,35 +789,8 @@ def create_post(
         image_name,
         image_mime,
         approval_status,
-        approved_at,
         now_str(),
     ))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def approve_post(post_id: int, admin_user_id: int) -> None:
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-    UPDATE community_post
-    SET approval_status = 'approved', approved_by = %s, approved_at = %s
-    WHERE post_id = %s
-    """, (admin_user_id, now_str(), post_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def reject_post(post_id: int, admin_user_id: int) -> None:
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-    UPDATE community_post
-    SET approval_status = 'rejected', approved_by = %s, approved_at = %s
-    WHERE post_id = %s
-    """, (admin_user_id, now_str(), post_id))
     conn.commit()
     cur.close()
     conn.close()
@@ -954,9 +899,6 @@ def user_liked_post(post_id: int, user_id: int) -> bool:
     return found
 
 
-# =========================================================
-# 메일함 / 보고서 발송
-# =========================================================
 def send_report_message(
     sender_user_id: int,
     receiver_user_id: int,
@@ -1013,6 +955,76 @@ def load_received_messages(receiver_user_id: int) -> pd.DataFrame:
 
 
 # =========================================================
+# 화면 유틸
+# =========================================================
+def render_post_image(image_bytes, image_name: Optional[str], image_mime: Optional[str]) -> None:
+    image_bytes = normalize_binary_data(image_bytes)
+    if not image_bytes:
+        return
+    if image_mime and not str(image_mime).startswith("image/"):
+        return
+    try:
+        st.image(image_bytes, caption=image_name, use_container_width=True)
+    except Exception:
+        st.caption("이미지 표시 중 오류가 발생했습니다.")
+
+
+def render_post_detail_expander(
+    row,
+    allow_like: bool,
+    allow_comment: bool,
+    comment_form_prefix: str,
+    comments_title: str = "댓글",
+    anonymous_meta: bool = False,
+) -> None:
+    post_id = int(row["post_id"])
+    title = str(row["title"])
+
+    with st.expander(title, expanded=False):
+        if anonymous_meta:
+            st.caption(f"익명 게시글 · 작성일: {row['created_at']}")
+        else:
+            st.caption(
+                f"작성자: {row['author_name']} · 유형: {role_badge(row['author_role'])} · 작성일: {row['created_at']}"
+            )
+
+        st.write(row["content"])
+        render_post_image(row.get("image_bytes"), row.get("image_name"), row.get("image_mime"))
+
+        if allow_like:
+            cols = st.columns([1, 1, 4])
+            liked = user_liked_post(post_id, int(st.session_state["user_id"]))
+            like_label = "좋아요 취소" if liked else "좋아요"
+            with cols[0]:
+                if st.button(f"{like_label} ({int(row['like_count'])})", key=f"{comment_form_prefix}_like_{post_id}"):
+                    toggle_like(post_id, int(st.session_state["user_id"]))
+                    st.rerun()
+            with cols[1]:
+                st.write(f"댓글 {int(row['comment_count'])}")
+        else:
+            st.caption(f"댓글 {int(row['comment_count'])}")
+
+        comments = load_comments(post_id)
+        if not comments.empty:
+            st.markdown(comments_title)
+            for _, c_row in comments.iterrows():
+                badge = " [전문가]" if c_row["role"] == "expert" else ""
+                st.write(f"- {c_row['author_name']}{badge}: {c_row['content']} ({c_row['created_at']})")
+
+        if allow_comment:
+            with st.form(key=f"{comment_form_prefix}_comment_form_{post_id}", clear_on_submit=True):
+                comment_text = st.text_input("댓글 작성", key=f"{comment_form_prefix}_comment_{post_id}")
+                submitted = st.form_submit_button("댓글 등록", use_container_width=True)
+            if submitted:
+                if not safe_text(comment_text):
+                    st.warning("댓글 내용을 입력해주세요.")
+                else:
+                    add_comment(post_id, int(st.session_state["user_id"]), comment_text)
+                    st.success("댓글이 등록되었습니다.")
+                    st.rerun()
+
+
+# =========================================================
 # 화면 렌더링
 # =========================================================
 def render_auth_page() -> None:
@@ -1051,7 +1063,6 @@ def render_auth_page() -> None:
         sign_username = st.text_input("아이디", key="signup_username")
         sign_password = st.text_input("비밀번호", type="password", key="signup_password")
         sign_password2 = st.text_input("비밀번호 확인", type="password", key="signup_password2")
-
         sign_nickname = st.text_input("닉네임", key="signup_nickname")
         st.caption("닉네임은 일반 이용자 / 시니어 이용자 / 전문가 전체에서 중복 없이 사용됩니다.")
 
@@ -1125,64 +1136,37 @@ def render_general_public_community() -> None:
         return
 
     for _, row in posts.iterrows():
-        with st.container(border=True):
-            st.write(f"제목: {row['title']}")
-            st.caption(f"작성자: {row['author_name']} · 유형: {role_badge(row['author_role'])} · 작성일: {row['created_at']}")
-            st.write(row["content"])
-
-            if row["image_bytes"] is not None:
-                st.image(row["image_bytes"], caption=row["image_name"], use_container_width=True)
-
-            cols = st.columns([1, 1, 4])
-            liked = user_liked_post(int(row["post_id"]), int(st.session_state["user_id"]))
-            like_label = "좋아요 취소" if liked else "좋아요"
-
-            with cols[0]:
-                if st.button(f"{like_label} ({int(row['like_count'])})", key=f"like_{row['post_id']}"):
-                    toggle_like(int(row["post_id"]), int(st.session_state["user_id"]))
-                    st.rerun()
-
-            with cols[1]:
-                st.write(f"댓글 {int(row['comment_count'])}")
-
-            comments = load_comments(int(row["post_id"]))
-            if not comments.empty:
-                st.markdown("댓글")
-                for _, c_row in comments.iterrows():
-                    badge = " [전문가]" if c_row["role"] == "expert" else ""
-                    st.write(f"- {c_row['author_name']}{badge}: {c_row['content']} ({c_row['created_at']})")
-
-            comment_text = st.text_input("댓글 작성", key=f"public_comment_{row['post_id']}")
-            if st.button("댓글 등록", key=f"public_comment_submit_{row['post_id']}"):
-                if not safe_text(comment_text):
-                    st.warning("댓글 내용을 입력해주세요.")
-                else:
-                    add_comment(int(row["post_id"]), int(st.session_state["user_id"]), comment_text)
-                    st.success("댓글이 등록되었습니다.")
-                    st.rerun()
+        render_post_detail_expander(
+            row=row,
+            allow_like=True,
+            allow_comment=True,
+            comment_form_prefix="public",
+            comments_title="댓글",
+            anonymous_meta=False,
+        )
 
 
 def render_general_anonymous_write_only() -> None:
     st.subheader("익명 커뮤니티")
-    st.caption("익명 커뮤니티 게시글은 전문가만 열람 및 댓글 작성이 가능합니다.")
+    st.caption("익명 커뮤니티 게시글은 관리자 승인 없이 바로 등록되며, 전문가만 열람 및 댓글 작성이 가능합니다.")
 
-    title = st.text_input("익명 게시글 제목", key="anon_title_general")
-    content = st.text_area("익명 게시글 내용", key="anon_content_general", height=160)
-    uploaded = st.file_uploader(
-        "사진 업로드",
-        type=["png", "jpg", "jpeg", "webp"],
-        key="anon_file_general",
-    )
+    with st.form("general_anonymous_post_form", clear_on_submit=True):
+        title = st.text_input("익명 게시글 제목", key="anon_title_general")
+        content = st.text_area("익명 게시글 내용", key="anon_content_general", height=160)
+        uploaded = st.file_uploader(
+            "사진 업로드",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="anon_file_general",
+        )
+        submitted = st.form_submit_button("익명 커뮤니티 글 등록", use_container_width=True)
 
-    if st.button("익명 커뮤니티 글 등록", key="anon_submit_general", use_container_width=True):
+    if submitted:
         try:
             if not safe_text(title) or not safe_text(content):
                 raise ValueError("제목과 내용을 입력해주세요.")
-
             image_bytes = uploaded.getvalue() if uploaded else None
             image_name = uploaded.name if uploaded else None
             image_mime = uploaded.type if uploaded else None
-
             create_post(
                 board_type="anonymous",
                 author_user_id=st.session_state["user_id"],
@@ -1192,7 +1176,7 @@ def render_general_anonymous_write_only() -> None:
                 image_name=image_name,
                 image_mime=image_mime,
             )
-            st.success("익명 게시글이 등록되었습니다. 관리자 승인 없이 바로 전문가에게 공개됩니다.")
+            st.success("익명 게시글이 등록되었습니다.")
             st.rerun()
         except Exception as e:
             st.error(f"익명 게시글 등록 중 오류가 발생했습니다: {e}")
@@ -1207,17 +1191,16 @@ def render_general_inbox() -> None:
         return
 
     for _, row in df.iterrows():
-        with st.container(border=True):
+        with st.expander(str(row["title"]), expanded=False):
             sender_badge = "전문가" if row["sender_role"] == "expert" else role_badge(row["sender_role"])
-            st.write(f"제목: {row['title']}")
             st.caption(f"발신자: {row['sender_name']} ({sender_badge}) · 수신일: {row['created_at']}")
             if safe_text(row["message_text"]):
                 st.write(row["message_text"])
-
-            if row["file_bytes"] is not None:
+            file_bytes = normalize_binary_data(row["file_bytes"])
+            if file_bytes:
                 st.download_button(
                     label=f"첨부파일 다운로드: {row['file_name']}",
-                    data=bytes(row["file_bytes"]),
+                    data=file_bytes,
                     file_name=row["file_name"],
                     mime=row["file_mime"] or "application/octet-stream",
                     key=f"inbox_download_{row['message_id']}",
@@ -1396,7 +1379,20 @@ def render_expert_report_generator() -> None:
 
 def render_expert_public_community() -> None:
     st.subheader("공개 커뮤니티")
-    render_general_public_community()
+    posts = load_posts("public", include_pending=False)
+    if posts.empty:
+        st.info("아직 승인된 공개 게시글이 없습니다.")
+        return
+
+    for _, row in posts.iterrows():
+        render_post_detail_expander(
+            row=row,
+            allow_like=True,
+            allow_comment=True,
+            comment_form_prefix="expert_public",
+            comments_title="댓글",
+            anonymous_meta=False,
+        )
 
 
 def render_expert_anonymous_comments() -> None:
@@ -1405,33 +1401,18 @@ def render_expert_anonymous_comments() -> None:
 
     posts = load_posts("anonymous", include_pending=False)
     if posts.empty:
-        st.info("승인된 익명 게시글이 없습니다.")
+        st.info("등록된 익명 게시글이 없습니다.")
         return
 
     for _, row in posts.iterrows():
-        with st.container(border=True):
-            st.write(f"제목: {row['title']}")
-            st.caption(f"익명 게시글 · 작성일: {row['created_at']}")
-            st.write(row["content"])
-
-            if row["image_bytes"] is not None:
-                st.image(row["image_bytes"], caption=row["image_name"], use_container_width=True)
-
-            comments = load_comments(int(row["post_id"]))
-            if not comments.empty:
-                st.markdown("전문가 댓글")
-                for _, c_row in comments.iterrows():
-                    badge = " [전문가]" if c_row["role"] == "expert" else ""
-                    st.write(f"- {c_row['author_name']}{badge}: {c_row['content']} ({c_row['created_at']})")
-
-            comment_text = st.text_input("댓글 작성", key=f"anon_comment_{row['post_id']}")
-            if st.button("댓글 등록", key=f"anon_comment_submit_{row['post_id']}"):
-                if not safe_text(comment_text):
-                    st.warning("댓글 내용을 입력해주세요.")
-                else:
-                    add_comment(int(row["post_id"]), int(st.session_state["user_id"]), comment_text)
-                    st.success("댓글이 등록되었습니다.")
-                    st.rerun()
+        render_post_detail_expander(
+            row=row,
+            allow_like=False,
+            allow_comment=True,
+            comment_form_prefix="anonymous",
+            comments_title="전문가 댓글",
+            anonymous_meta=True,
+        )
 
 
 def render_expert_send_report() -> None:
@@ -1446,40 +1427,34 @@ def render_expert_send_report() -> None:
         else:
             st.dataframe(results, use_container_width=True, hide_index=True)
 
-    receiver_nickname = st.text_input("수신자 닉네임", key="send_receiver_nickname")
-    title = st.text_input("발송 제목", value="심리검사 보고서", key="send_report_title")
-    message_text = st.text_area("메시지", value="보고서를 전달드립니다.", key="send_report_message")
+    with st.form("send_report_form"):
+        receiver_nickname = st.text_input("수신자 닉네임", key="send_receiver_nickname")
+        title = st.text_input("발송 제목", value="심리검사 보고서", key="send_report_title")
+        message_text = st.text_area("메시지", value="보고서를 전달드립니다.", key="send_report_message")
 
-    send_mode = st.radio(
-        "발송 방식",
-        options=["방금 생성한 PDF 발송", "직접 파일 업로드"],
-        horizontal=True,
-        key="send_mode",
-    )
-
-    file_name = ""
-    file_mime = ""
-    file_bytes = None
-
-    if send_mode == "직접 파일 업로드":
-        uploaded = st.file_uploader(
-            "발송 파일 업로드",
-            type=["pdf", "txt", "doc", "docx"],
-            key="send_report_upload",
+        send_mode = st.radio(
+            "발송 방식",
+            options=["방금 생성한 PDF 발송", "직접 파일 업로드"],
+            horizontal=True,
+            key="send_mode",
         )
-        if uploaded:
-            file_name = uploaded.name
-            file_mime = uploaded.type or "application/octet-stream"
-            file_bytes = uploaded.getvalue()
-    else:
-        if st.session_state.get("last_generated_pdf") is None:
-            st.warning("현재 세션에서 생성된 보고서 PDF가 없습니다. 먼저 보고서를 생성하거나 직접 업로드를 선택해주세요.")
-        else:
-            file_name = "psycolor_report.pdf"
-            file_mime = "application/pdf"
-            file_bytes = st.session_state["last_generated_pdf"]
 
-    if st.button("보고서 발송", type="primary", use_container_width=True, key="send_report_btn"):
+        uploaded = None
+        if send_mode == "직접 파일 업로드":
+            uploaded = st.file_uploader(
+                "발송 파일 업로드",
+                type=["pdf", "txt", "doc", "docx"],
+                key="send_report_upload",
+            )
+        else:
+            if st.session_state.get("last_generated_pdf") is None:
+                st.info("현재 세션에서 생성된 보고서 PDF가 없습니다. 직접 파일 업로드를 선택하거나 먼저 보고서를 생성해주세요.")
+            else:
+                st.caption("현재 세션에서 생성한 최신 PDF가 발송됩니다.")
+
+        submitted = st.form_submit_button("보고서 발송", type="primary", use_container_width=True)
+
+    if submitted:
         try:
             if not safe_text(receiver_nickname):
                 raise ValueError("수신자 닉네임을 입력해주세요.")
@@ -1489,8 +1464,19 @@ def render_expert_send_report() -> None:
                 raise ValueError("해당 닉네임의 사용자를 찾을 수 없습니다.")
             if receiver["role"] != "general":
                 raise ValueError("보고서는 일반 이용자에게만 발송할 수 있습니다.")
-            if not file_bytes:
-                raise ValueError("발송할 파일이 없습니다.")
+
+            if send_mode == "직접 파일 업로드":
+                if uploaded is None:
+                    raise ValueError("업로드할 파일을 선택해주세요.")
+                file_name = uploaded.name
+                file_mime = uploaded.type or "application/octet-stream"
+                file_bytes = uploaded.getvalue()
+            else:
+                file_name = "psycolor_report.pdf"
+                file_mime = "application/pdf"
+                file_bytes = normalize_binary_data(st.session_state.get("last_generated_pdf"))
+                if not file_bytes:
+                    raise ValueError("발송할 PDF가 없습니다. 먼저 보고서를 생성하거나 직접 파일 업로드를 선택해주세요.")
 
             send_report_message(
                 sender_user_id=int(st.session_state["user_id"]),
@@ -1504,47 +1490,6 @@ def render_expert_send_report() -> None:
             st.success("보고서가 발송되었습니다.")
         except Exception as e:
             st.error(f"보고서 발송 중 오류가 발생했습니다: {e}")
-
-
-def render_admin_dashboard() -> None:
-    st.subheader("보고서 생성 누적 기록")
-    df = load_generated_reports(limit=200)
-    if df.empty:
-        st.info("아직 저장된 보고서 기록이 없습니다.")
-    else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader("게시글 승인")
-
-    public_pending = load_posts("public", include_pending=True)
-
-    pending = public_pending[public_pending["approval_status"] == "pending"].copy()
-
-    if pending.empty:
-        st.info("승인 대기 중인 게시글이 없습니다.")
-        return
-
-    for _, row in pending.iterrows():
-        with st.container(border=True):
-            board_name = "공개 커뮤니티"
-            st.write(f"[{board_name}] {row['title']}")
-            st.caption(f"작성자: {row['author_name']} · 권한: {role_badge(row['author_role'])} · 작성일: {row['created_at']}")
-            st.write(row["content"])
-            if row["image_bytes"] is not None:
-                st.image(row["image_bytes"], caption=row["image_name"], use_container_width=True)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("승인", key=f"approve_{row['post_id']}", use_container_width=True):
-                    approve_post(int(row["post_id"]), int(st.session_state["user_id"]))
-                    st.success("게시글을 승인했습니다.")
-                    st.rerun()
-            with c2:
-                if st.button("반려", key=f"reject_{row['post_id']}", use_container_width=True):
-                    reject_post(int(row["post_id"]), int(st.session_state["user_id"]))
-                    st.success("게시글을 반려했습니다.")
-                    st.rerun()
 
 
 def render_general_page() -> None:
@@ -1571,11 +1516,6 @@ def render_expert_page() -> None:
         render_expert_anonymous_comments()
     with tab4:
         render_expert_send_report()
-
-
-def render_admin_page() -> None:
-    st.title("관리자")
-    render_admin_dashboard()
 
 
 # =========================================================
