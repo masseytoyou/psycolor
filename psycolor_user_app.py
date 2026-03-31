@@ -799,11 +799,15 @@ def create_post(
 ) -> None:
     conn = get_connection()
     cur = conn.cursor()
+
+    approval_status = "approved" if board_type == "anonymous" else "pending"
+    approved_at = now_str() if board_type == "anonymous" else None
+
     cur.execute("""
     INSERT INTO community_post (
         board_type, author_user_id, title, content, image_bytes, image_name, image_mime,
-        approval_status, created_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
+        approval_status, approved_at, created_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         board_type,
         author_user_id,
@@ -812,6 +816,8 @@ def create_post(
         psycopg2.Binary(image_bytes) if image_bytes else None,
         image_name,
         image_mime,
+        approval_status,
+        approved_at,
         now_str(),
     ))
     conn.commit()
@@ -1186,7 +1192,7 @@ def render_general_anonymous_write_only() -> None:
                 image_name=image_name,
                 image_mime=image_mime,
             )
-            st.success("익명 게시글이 등록되었습니다. 관리자 승인 후 전문가에게 공개됩니다.")
+            st.success("익명 게시글이 등록되었습니다. 관리자 승인 없이 바로 전문가에게 공개됩니다.")
             st.rerun()
         except Exception as e:
             st.error(f"익명 게시글 등록 중 오류가 발생했습니다: {e}")
@@ -1512,15 +1518,8 @@ def render_admin_dashboard() -> None:
     st.subheader("게시글 승인")
 
     public_pending = load_posts("public", include_pending=True)
-    anon_pending = load_posts("anonymous", include_pending=True)
 
-    pending = pd.concat(
-        [
-            public_pending[public_pending["approval_status"] == "pending"],
-            anon_pending[anon_pending["approval_status"] == "pending"],
-        ],
-        ignore_index=True,
-    )
+    pending = public_pending[public_pending["approval_status"] == "pending"].copy()
 
     if pending.empty:
         st.info("승인 대기 중인 게시글이 없습니다.")
@@ -1528,7 +1527,7 @@ def render_admin_dashboard() -> None:
 
     for _, row in pending.iterrows():
         with st.container(border=True):
-            board_name = "공개 커뮤니티" if row["board_type"] == "public" else "익명 커뮤니티"
+            board_name = "공개 커뮤니티"
             st.write(f"[{board_name}] {row['title']}")
             st.caption(f"작성자: {row['author_name']} · 권한: {role_badge(row['author_role'])} · 작성일: {row['created_at']}")
             st.write(row["content"])
