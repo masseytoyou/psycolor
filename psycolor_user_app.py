@@ -1181,6 +1181,25 @@ def render_general_anonymous_write_only() -> None:
         except Exception as e:
             st.error(f"익명 게시글 등록 중 오류가 발생했습니다: {e}")
 
+    st.divider()
+    st.markdown("내가 작성한 익명 게시글")
+    my_posts = load_posts("anonymous", include_pending=False)
+    my_posts = my_posts[my_posts["author_user_id"] == int(st.session_state["user_id"])]
+
+    if my_posts.empty:
+        st.info("아직 작성한 익명 게시글이 없습니다.")
+        return
+
+    for _, row in my_posts.iterrows():
+        render_post_detail_expander(
+            row=row,
+            allow_like=False,
+            allow_comment=False,
+            comment_form_prefix="general_my_anonymous",
+            comments_title="전문가 댓글",
+            anonymous_meta=True,
+        )
+
 
 def render_general_inbox() -> None:
     st.subheader("보고서 수신함")
@@ -1228,7 +1247,7 @@ def render_expert_report_generator() -> None:
         st.markdown("수검자 정보")
         examinee_name = st.text_input("이름", key="exp_examinee_name")
         date_of_birth = st.text_input("생년월일", key="exp_dob")
-        sex = st.selectbox("성별", options=["", "남", "여", "기타"], key="exp_sex")
+        sex = st.selectbox("성별", options=["", "남", "여"], key="exp_sex")
         examiner = st.text_input("검사자", value=st.session_state.get("nickname") or st.session_state.get("username"), key="exp_examiner")
         test_date = st.text_input("검사일", key="exp_test_date")
 
