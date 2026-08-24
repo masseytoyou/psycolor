@@ -10,6 +10,54 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
+
+# Linux(Streamlit Cloud)에서 한글이 깨지지 않도록 사용 가능한 CJK 폰트를 자동 탐색합니다.
+def _configure_korean_matplotlib_font() -> str:
+    # 프로젝트에 한글 폰트 파일을 함께 배포할 수 있으면 그것을 최우선으로 사용합니다.
+    local_font_candidates = [
+        os.path.join(os.path.dirname(__file__), "NanumGothic.ttf"),
+        os.path.join(os.path.dirname(__file__), "NotoSansCJKkr-Regular.otf"),
+        os.path.join(os.path.dirname(__file__), "NotoSansKR-Regular.ttf"),
+    ]
+    for font_path in local_font_candidates:
+        if os.path.exists(font_path):
+            try:
+                font_manager.fontManager.addfont(font_path)
+                font_name = font_manager.FontProperties(fname=font_path).get_name()
+                plt.rcParams["font.family"] = font_name
+                plt.rcParams["axes.unicode_minus"] = False
+                return font_name
+            except Exception:
+                pass
+
+    candidates = [
+        "Noto Sans CJK KR", "Noto Sans CJK Korean", "Noto Sans KR",
+        "NanumGothic", "NanumGothicCoding", "Malgun Gothic",
+        "AppleGothic", "DejaVu Sans",
+    ]
+    available = {font.name: font.fname for font in font_manager.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            plt.rcParams["font.family"] = name
+            plt.rcParams["axes.unicode_minus"] = False
+            return name
+    # 이름이 등록되지 않은 경우 파일명으로 한 번 더 탐색
+    for path in font_manager.findSystemFonts(fontext="ttf"):
+        lower = path.lower()
+        if any(token in lower for token in ["noto", "nanum", "malgun"]):
+            try:
+                font_name = font_manager.FontProperties(fname=path).get_name()
+                plt.rcParams["font.family"] = font_name
+                plt.rcParams["axes.unicode_minus"] = False
+                return font_name
+            except Exception:
+                pass
+    plt.rcParams["axes.unicode_minus"] = False
+    return "DejaVu Sans"
+
+_KOREAN_FONT_NAME = _configure_korean_matplotlib_font()
+from matplotlib import font_manager
 import numpy as np
 import pandas as pd
 import psycopg2
@@ -620,6 +668,7 @@ def init_db() -> None:
                 message_id BIGSERIAL PRIMARY KEY,
                 sender_user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
                 receiver_user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                test_id TEXT REFERENCES test_run(test_id) ON DELETE SET NULL,
                 title TEXT NOT NULL,
                 message_text TEXT,
                 file_name TEXT,
@@ -628,6 +677,9 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             )
             """)
+
+            if not column_exists(conn, "inbox_message", "test_id"):
+                cur.execute("ALTER TABLE inbox_message ADD COLUMN test_id TEXT")
 
         conn.commit()
     except Exception:
@@ -946,6 +998,50 @@ def build_index_profile_chart(index_scores: Dict[str, int], title: str = "인지
     return buf.getvalue()
 
 
+def build_subtest_profile_chart(subtest_scores: Dict[str, int], title: str = "소검사 환산점수 프로파일") -> Optional[bytes]:
+    """현재 검사 회차의 소검사 환산점수(1~19)를 프로파일 형태로 시각화합니다."""
+    if not subtest_scores:
+        return None
+
+    labels = list(subtest_scores.keys())
+    values = [float(subtest_scores[k]) for k in labels]
+    x = np.arange(len(labels))
+
+    fig_width = max(8.2, min(14.0, 0.62 * len(labels) + 4.0))
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
+    ax.axhspan(8, 12, alpha=0.12, zorder=0)
+    ax.axhline(10, linewidth=1.2, linestyle="--", alpha=0.65, zorder=1)
+    ax.plot(x, values, marker="o", markersize=7, linewidth=2.0, zorder=3)
+
+    for xi, value in zip(x, values):
+        ax.annotate(
+            f"{int(value)}", (xi, value), xytext=(0, 9),
+            textcoords="offset points", ha="center", fontsize=9, fontweight="bold"
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("환산점수", fontsize=10)
+    ax.set_ylim(1, 19)
+    ax.set_yticks(range(1, 20, 2))
+    ax.set_title(title, fontsize=14, pad=16, fontweight="bold")
+    ax.grid(axis="y", alpha=0.22, linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.text(
+        0.99, 0.03,
+        "음영: 일반적인 중간 범위(8~12)  |  점선: 10",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=8.5, alpha=0.75,
+    )
+    fig.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def build_index_trend_chart(df_history: pd.DataFrame) -> Optional[bytes]:
     """회차별 지표점수 추이를 라인차트 PNG bytes로 생성합니다."""
     df_idx = df_history[df_history["result_type"] == "index"].copy()
@@ -1241,65 +1337,48 @@ def user_liked_post(post_id: int, user_id: int) -> bool:
 
 
 def send_report_message(
-    sender_user_id: int,
-    receiver_user_id: int,
-    title: str,
-    message_text: str,
-    file_name: str,
-    file_mime: str,
-    file_bytes: bytes,
+    sender_user_id: int, receiver_user_id: int, title: str, message_text: str,
+    file_name: str, file_mime: str, file_bytes: bytes, test_id: Optional[str] = None,
 ) -> None:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO inbox_message (
-        sender_user_id, receiver_user_id, title, message_text,
-        file_name, file_mime, file_bytes, created_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        sender_user_id,
-        receiver_user_id,
-        safe_text(title),
-        safe_text(message_text),
-        file_name,
-        file_mime,
-        psycopg2.Binary(file_bytes),
-        now_str(),
-    ))
-    conn.commit()
-    cur.close()
-    release_connection(conn)
-    _load_received_messages_cached.clear()
+    try:
+        cur.execute("""
+        INSERT INTO inbox_message (
+            sender_user_id, receiver_user_id, test_id, title, message_text,
+            file_name, file_mime, file_bytes, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (sender_user_id, receiver_user_id, test_id, safe_text(title), safe_text(message_text),
+              file_name, file_mime, psycopg2.Binary(file_bytes), now_str()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_connection(conn)
 
 
 def load_received_messages(receiver_user_id: int) -> pd.DataFrame:
     return _load_received_messages_cached(receiver_user_id)
 
-
-@st.cache_data(ttl=20)
 def _load_received_messages_cached(receiver_user_id: int) -> pd.DataFrame:
+    # BYTEA가 포함된 DataFrame은 Streamlit cache 직렬화 문제를 피하기 위해 캐시하지 않습니다.
     conn = get_connection()
-    query = """
-    SELECT
-        m.message_id,
-        m.title,
-        m.message_text,
-        m.file_name,
-        m.file_mime,
-        m.file_bytes,
-        m.created_at,
-        COALESCE(u.nickname, u.username, '-') AS sender_name,
-        u.role AS sender_role
-    FROM inbox_message m
-    JOIN users u
-        ON m.sender_user_id = u.user_id
-    WHERE m.receiver_user_id = %s
-    ORDER BY m.created_at DESC
-    """
-    df = pd.read_sql_query(query, conn, params=(receiver_user_id,))
-    release_connection(conn)
-    return df
-
+    try:
+        query = """
+        SELECT m.message_id, m.test_id, m.title, m.message_text, m.file_name, m.file_mime,
+               m.file_bytes, m.created_at,
+               COALESCE(u.nickname, u.username, '-') AS sender_name, u.role AS sender_role
+        FROM inbox_message m JOIN users u ON m.sender_user_id = u.user_id
+        WHERE m.receiver_user_id = %s ORDER BY m.created_at DESC
+        """
+        df = pd.read_sql_query(query, conn, params=(receiver_user_id,))
+        if "file_bytes" in df.columns:
+            df["file_bytes"] = df["file_bytes"].map(normalize_binary_data)
+        return df
+    finally:
+        release_connection(conn)
 
 # =========================================================
 # 화면 유틸
@@ -1551,6 +1630,57 @@ def render_general_anonymous_write_only() -> None:
 
 
 @_fragment_decorator
+def get_test_identity(test_id: str) -> Optional[Tuple[str, str, str]]:
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            "SELECT examinee_name, date_of_birth, test_type FROM test_run WHERE test_id = %s",
+            conn, params=(test_id,)
+        )
+        if df.empty:
+            return None
+        row = df.iloc[0]
+        return str(row["examinee_name"] or ""), str(row["date_of_birth"] or ""), str(row["test_type"] or "")
+    finally:
+        release_connection(conn)
+
+
+def render_cumulative_for_test_id(test_id: str, key_suffix: str) -> None:
+    identity = get_test_identity(test_id)
+    if not identity:
+        st.warning("연결된 검사 기록을 찾을 수 없습니다.")
+        return
+    name, dob, test_type = identity
+    history = get_examinee_test_history(name, dob, test_type or None)
+    if history.empty:
+        st.info("해당 보고서와 연결된 누적 검사 기록이 없습니다.")
+        return
+
+    st.markdown("#### 누적 검사 결과")
+    st.caption(f"수검자: {name} · 생년월일: {dob}")
+    st.success(f"총 {history['test_id'].nunique()}회 검사 기록")
+
+    radar_png = build_index_radar_chart(history)
+    trend_png = build_index_trend_chart(history)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if radar_png:
+            st.image(radar_png, caption="최근 회차 지표점수 프로파일", use_container_width=True)
+        else:
+            st.info("레이더차트를 표시할 지표점수가 부족합니다.")
+    with col_b:
+        if trend_png:
+            st.image(trend_png, caption="회차별 지표점수 추이", use_container_width=True)
+        else:
+            st.info("추이차트를 표시하려면 2회 이상의 검사 기록이 필요합니다.")
+
+    with st.expander("전체 검사 결과 보기", expanded=False):
+        st.dataframe(
+            history[["test_date", "test_type", "result_type", "result_name", "raw_score", "classification"]],
+            use_container_width=True, hide_index=True
+        )
+
+
 def render_general_inbox() -> None:
     st.subheader("보고서 수신함")
 
@@ -1560,11 +1690,22 @@ def render_general_inbox() -> None:
         return
 
     for _, row in df.iterrows():
+        message_id = int(row["message_id"])
         with st.expander(str(row["title"]), expanded=False):
             sender_badge = "전문가" if row["sender_role"] == "expert" else role_badge(row["sender_role"])
             st.caption(f"발신자: {row['sender_name']} ({sender_badge}) · 수신일: {row['created_at']}")
             if safe_text(row["message_text"]):
                 st.write(row["message_text"])
+
+            test_id = safe_text(row.get("test_id"))
+            if test_id:
+                if st.button("이 보고서의 누적 결과 보기", key=f"inbox_cumulative_{message_id}", use_container_width=True):
+                    st.session_state[f"show_cumulative_{message_id}"] = True
+                if st.session_state.get(f"show_cumulative_{message_id}", False):
+                    render_cumulative_for_test_id(test_id, str(message_id))
+            else:
+                st.caption("이 보고서는 검사 기록과 연결되어 있지 않아 누적 결과를 바로 볼 수 없습니다.")
+
             file_bytes = normalize_binary_data(row["file_bytes"])
             if file_bytes:
                 st.download_button(
@@ -1572,7 +1713,7 @@ def render_general_inbox() -> None:
                     data=file_bytes,
                     file_name=row["file_name"],
                     mime=row["file_mime"] or "application/octet-stream",
-                    key=f"inbox_download_{row['message_id']}",
+                    key=f"inbox_download_{message_id}",
                     use_container_width=True,
                 )
 
@@ -1599,7 +1740,7 @@ def render_expert_report_generator() -> None:
         st.markdown("수검자 정보")
         examinee_name = st.text_input("이름", key="exp_examinee_name")
         date_of_birth = st.text_input("생년월일", key="exp_dob")
-        sex = st.selectbox("성별", options=["", "남", "여", "기타"], key="exp_sex")
+        sex = st.selectbox("성별", options=["", "남", "여"], key="exp_sex")
         examiner = st.text_input("검사자", value=st.session_state.get("nickname") or st.session_state.get("username"), key="exp_examiner")
         test_date = st.text_input("검사일", key="exp_test_date")
 
@@ -1655,9 +1796,13 @@ def render_expert_report_generator() -> None:
                 key="expert_generated_report_view",
             )
             profile_png = st.session_state.get("last_generated_profile_png")
+            subtest_profile_png = st.session_state.get("last_generated_subtest_profile_png")
             if profile_png:
                 st.markdown("#### 영역별 지표점수 프로파일")
                 st.image(profile_png, caption="현재 검사 회차 지표점수 프로파일", use_container_width=True)
+            if subtest_profile_png:
+                st.markdown("#### 소검사 환산점수 프로파일")
+                st.image(subtest_profile_png, caption="현재 검사 회차 소검사 환산점수 프로파일", use_container_width=True)
         else:
             st.info("아직 생성된 보고서가 없습니다.")
 
@@ -1695,18 +1840,21 @@ def render_expert_report_generator() -> None:
 
             txt_content = "\n".join(["[최종 보고서]", final_report_text])
 
-            # 방금 입력한 현재 회차의 지표점수 프로파일을 PDF에도 함께 첨부합니다.
+            # 현재 회차의 지표점수와 소검사 환산점수 프로파일을 PDF에도 함께 첨부합니다.
             profile_png = build_index_profile_chart(index_scores)
-            pdf_chart_images = [profile_png] if profile_png else None
+            subtest_profile_png = build_subtest_profile_chart(subtest_scores)
+            pdf_chart_images = [img for img in [profile_png, subtest_profile_png] if img]
             pdf_bytes = make_pdf_bytes(
                 "Psycolor Report",
                 final_report_text.splitlines(),
-                chart_images=pdf_chart_images,
+                chart_images=pdf_chart_images or None,
             )
             txt_bytes = make_txt_bytes(txt_content)
 
             st.session_state["last_generated_index_scores"] = dict(index_scores)
+            st.session_state["last_generated_subtest_scores"] = dict(subtest_scores)
             st.session_state["last_generated_profile_png"] = profile_png
+            st.session_state["last_generated_subtest_profile_png"] = subtest_profile_png
 
             st.session_state["last_generated_test_id"] = saved_test_id
             st.session_state["last_generated_report"] = final_report_text
@@ -1875,6 +2023,7 @@ def render_expert_send_report() -> None:
                 file_name=file_name,
                 file_mime=file_mime,
                 file_bytes=file_bytes,
+                test_id=(st.session_state.get("last_generated_test_id") if send_mode != "직접 파일 업로드" else None),
             )
             st.success("보고서가 발송되었습니다.")
         except Exception as e:
@@ -1883,7 +2032,9 @@ def render_expert_send_report() -> None:
 
 def render_general_page() -> None:
     st.title("일반 이용자")
-    tab1, tab2, tab3 = st.tabs(["공개 커뮤니티", "익명 커뮤니티", "보고서 수신함"])
+    tab1, tab2, tab3 = st.tabs([
+        "공개 커뮤니티", "익명 커뮤니티", "보고서 수신함"
+    ])
     with tab1:
         render_general_public_community()
     with tab2:
