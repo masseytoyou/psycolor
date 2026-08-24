@@ -7,11 +7,17 @@ from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import psycopg2
+import psycopg2.pool
 import streamlit as st
 from openai import OpenAI
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
@@ -32,6 +38,15 @@ ROLE_LABELS = {
     "expert": "전문가",
     "admin": "관리자",
 }
+
+# 스트림릿 버전에 따라 st.fragment / st.experimental_fragment 중 있는 것을 사용.
+# fragment로 감싼 함수는 그 안의 위젯을 조작할 때 앱 전체가 아니라 그 부분만 재실행되어
+# 다른 탭의 DB 조회 등이 매번 다시 실행되는 걸 막아줌 (버튼 누를 때 화면 전체가
+# 흐려지는 현상의 주 원인).
+_fragment_decorator = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+if _fragment_decorator is None:
+    def _fragment_decorator(func):
+        return func
 
 SELECTION = {
     "K-WPPSI-IV_A": {
@@ -96,7 +111,24 @@ def get_db_url() -> str:
 
 
 def get_connection():
-    return psycopg2.connect(get_db_url())
+    return get_connection_pool().getconn()
+
+
+def release_connection(conn) -> None:
+    """conn.close() 대체 함수: 커넥션을 실제로 끊지 않고 풀에 반납합니다."""
+    try:
+        get_connection_pool().putconn(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@st.cache_resource
+def get_connection_pool():
+    """DB 커넥션 풀. 앱 세션 전체에서 재사용되며 매 인터랙션마다 새로 연결하지 않습니다."""
+    return psycopg2.pool.SimpleConnectionPool(1, 10, get_db_url())
 
 
 def password_hash(password: str) -> str:
@@ -141,6 +173,10 @@ def init_session_state() -> None:
         "last_generated_txt": None,
         "pending_payment": False,
         "payment_notice_ack": False,
+        "dash_history_df": None,
+        "dash_radar_png": None,
+        "dash_trend_png": None,
+        "dash_pdf_with_chart": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -154,6 +190,7 @@ def logout() -> None:
         "last_generated_prompt", "last_generated_test_type",
         "last_generated_pdf", "last_generated_txt",
         "pending_payment", "payment_notice_ack",
+        "dash_history_df", "dash_radar_png", "dash_trend_png", "dash_pdf_with_chart",
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -301,7 +338,7 @@ def make_txt_bytes(text: str) -> bytes:
     return text.encode("utf-8")
 
 
-def make_pdf_bytes(title: str, lines: List[str]) -> bytes:
+def make_pdf_bytes(title: str, lines: List[str], chart_images: Optional[List[bytes]] = None) -> bytes:
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
 
@@ -354,6 +391,26 @@ def make_pdf_bytes(title: str, lines: List[str]) -> bytes:
 
                 c.drawString(left_margin, y, line)
                 y -= line_height
+
+    if chart_images:
+        for img_bytes in chart_images:
+            if not img_bytes:
+                continue
+            c.showPage()
+            img = ImageReader(BytesIO(img_bytes))
+            img_w, img_h = img.getSize()
+            aspect = img_h / img_w
+
+            draw_w = usable_width
+            draw_h = draw_w * aspect
+            max_h = height - top_margin - bottom_margin
+            if draw_h > max_h:
+                draw_h = max_h
+                draw_w = draw_h / aspect
+
+            x = left_margin + (usable_width - draw_w) / 2
+            y_img = height - top_margin - draw_h
+            c.drawImage(img, x, y_img, width=draw_w, height=draw_h)
 
     c.save()
     pdf_bytes = buffer.getvalue()
@@ -581,7 +638,7 @@ def init_db() -> None:
                 cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
         except Exception:
             pass
-        conn.close()
+        release_connection(conn)
 
 
 # =========================================================
@@ -616,7 +673,7 @@ def create_user(username: str, password: str, role: str, nickname: Optional[str]
         raise
     finally:
         cur.close()
-        conn.close()
+        release_connection(conn)
 
 
 def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
@@ -629,7 +686,7 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
     """, (safe_text(username),))
     row = cur.fetchone()
     cur.close()
-    conn.close()
+    release_connection(conn)
 
     if not row:
         return None
@@ -656,7 +713,7 @@ def get_user_by_nickname(nickname: str) -> Optional[Dict[str, str]]:
     """, (safe_text(nickname),))
     row = cur.fetchone()
     cur.close()
-    conn.close()
+    release_connection(conn)
 
     if not row:
         return None
@@ -679,7 +736,7 @@ def search_general_users_by_nickname(keyword: str) -> pd.DataFrame:
     LIMIT 20
     """
     df = pd.read_sql_query(query, conn, params=(f"%{safe_text(keyword)}%",))
-    conn.close()
+    release_connection(conn)
     return df
 
 
@@ -756,7 +813,208 @@ def save_test_run(
         raise
     finally:
         cur.close()
-        conn.close()
+        release_connection(conn)
+
+
+# =========================================================
+# 누적 결과 대시보드 (이력 조회 + 시각화)
+# =========================================================
+@st.cache_data(ttl=60)
+def get_examinee_test_history(
+    examinee_name: str,
+    date_of_birth: str,
+    test_type: Optional[str] = None,
+) -> pd.DataFrame:
+    """이름 + 생년월일로 동일 수검자의 회차별 검사 결과를 조회합니다."""
+    conn = get_connection()
+    try:
+        query = """
+        SELECT
+            tr.test_id,
+            tr.test_type,
+            tr.test_date,
+            tr.created_at,
+            trres.result_type,
+            trres.result_name,
+            trres.raw_score,
+            trres.classification
+        FROM test_run tr
+        JOIN test_result trres ON trres.test_id = tr.test_id
+        WHERE tr.examinee_name = %s AND tr.date_of_birth = %s
+        """
+        params: List[str] = [examinee_name, date_of_birth]
+        if test_type:
+            query += " AND tr.test_type = %s"
+            params.append(test_type)
+        query += " ORDER BY tr.created_at ASC"
+
+        return pd.read_sql(query, conn, params=params)
+    finally:
+        release_connection(conn)
+
+
+def build_index_radar_chart(df_history: pd.DataFrame) -> Optional[bytes]:
+    """가장 최근 회차의 지표점수로 레이더차트 PNG bytes를 생성합니다."""
+    df_idx = df_history[df_history["result_type"] == "index"]
+    if df_idx.empty:
+        return None
+
+    latest_test_id = df_idx.sort_values("created_at").iloc[-1]["test_id"]
+    latest = df_idx[df_idx["test_id"] == latest_test_id].drop_duplicates("result_name")
+
+    labels = latest["result_name"].tolist()
+    values = [float(v) for v in latest["raw_score"].tolist()]
+
+    if len(labels) < 3:
+        return None  # 레이더차트는 축이 3개 이상이어야 의미가 있음
+
+    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+    values_closed = values + values[:1]
+    angles_closed = angles + angles[:1]
+
+    fig, ax = plt.subplots(figsize=(4, 4), subplot_kw=dict(polar=True))
+    ax.plot(angles_closed, values_closed, linewidth=2, color="#4C72B0")
+    ax.fill(angles_closed, values_closed, alpha=0.25, color="#4C72B0")
+    ax.set_xticks(angles)
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylim(40, 160)
+    ax.set_title("지표점수 프로파일 (최근 회차)", fontsize=12, pad=20)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_index_trend_chart(df_history: pd.DataFrame) -> Optional[bytes]:
+    """회차별 지표점수 추이를 라인차트 PNG bytes로 생성합니다."""
+    df_idx = df_history[df_history["result_type"] == "index"].copy()
+    if df_idx.empty:
+        return None
+
+    session_order = df_idx.drop_duplicates("test_id").sort_values("created_at")["test_id"].tolist()
+    if len(session_order) < 2:
+        return None  # 추이 비교는 2회 이상부터 의미가 있음
+
+    df_idx["session_label"] = df_idx["test_date"].where(
+        df_idx["test_date"].fillna("").str.strip() != "", df_idx["created_at"]
+    )
+
+    pivot = df_idx.pivot_table(
+        index="test_id", columns="result_name", values="raw_score", aggfunc="first"
+    ).reindex(session_order)
+
+    session_labels = (
+        df_idx.drop_duplicates("test_id").set_index("test_id").loc[session_order, "session_label"].tolist()
+    )
+
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    for col in pivot.columns:
+        ax.plot(range(len(session_labels)), pivot[col], marker="o", label=col)
+
+    ax.set_xticks(range(len(session_labels)))
+    ax.set_xticklabels(session_labels, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("지표점수")
+    ax.set_title("회차별 지표점수 추이", fontsize=12)
+    ax.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1))
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@_fragment_decorator
+def render_cumulative_dashboard() -> None:
+    st.subheader("누적 검사 결과 대시보드")
+    st.caption("동일 수검자의 이름 + 생년월일 기준으로 회차별 결과를 비교합니다. (동명이인 주의)")
+
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        search_name = st.text_input("수검자 이름", key="dash_search_name")
+    with col2:
+        search_dob = st.text_input("생년월일", key="dash_search_dob")
+    with col3:
+        search_test_type = st.selectbox(
+            "검사 유형(선택)", options=[""] + list(SELECTION.keys()), key="dash_search_test_type"
+        )
+
+    search_clicked = st.button("조회", key="dash_search_button")
+
+    if search_clicked:
+        if not safe_text(search_name) or not safe_text(search_dob):
+            st.error("이름과 생년월일을 입력해주세요.")
+            return
+
+        df_history = get_examinee_test_history(
+            search_name.strip(), search_dob.strip(), search_test_type or None
+        )
+        st.session_state["dash_history_df"] = df_history
+
+    df_history = st.session_state.get("dash_history_df")
+    if df_history is None:
+        return
+
+    if df_history.empty:
+        st.info("해당 수검자의 검사 기록이 없습니다.")
+        return
+
+    n_sessions = df_history["test_id"].nunique()
+    st.success(f"총 {n_sessions}회 검사 기록을 찾았습니다.")
+
+    radar_png = build_index_radar_chart(df_history)
+    trend_png = build_index_trend_chart(df_history)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if radar_png:
+            st.image(radar_png, caption="최근 회차 지표점수 프로파일")
+        else:
+            st.info("레이더차트는 지표점수가 3개 이상일 때 표시됩니다.")
+    with col_b:
+        if trend_png:
+            st.image(trend_png, caption="회차별 지표점수 추이")
+        else:
+            st.info("추이차트는 검사 기록이 2회 이상일 때 표시됩니다.")
+
+    st.session_state["dash_radar_png"] = radar_png
+    st.session_state["dash_trend_png"] = trend_png
+
+    with st.expander("원본 데이터 보기"):
+        st.dataframe(
+            df_history[["test_date", "test_type", "result_type", "result_name", "raw_score", "classification"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if st.session_state.get("last_generated_report"):
+        st.divider()
+        if st.button("현재 보고서에 차트 포함해서 PDF 재생성", key="dash_pdf_with_chart_btn"):
+            chart_imgs = [img for img in [radar_png, trend_png] if img]
+            if not chart_imgs:
+                st.warning("포함할 차트가 없습니다. (지표점수 3개 이상 또는 검사 2회 이상 필요)")
+            else:
+                pdf_bytes = make_pdf_bytes(
+                    "Psycolor Report",
+                    st.session_state["last_generated_report"].splitlines(),
+                    chart_images=chart_imgs,
+                )
+                st.session_state["dash_pdf_with_chart"] = pdf_bytes
+                st.success("차트 포함 PDF가 생성되었습니다.")
+
+        if st.session_state.get("dash_pdf_with_chart"):
+            st.download_button(
+                "차트 포함 PDF 다운로드",
+                data=st.session_state["dash_pdf_with_chart"],
+                file_name="psycolor_report_with_chart.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="dash_pdf_with_chart_download",
+            )
 
 
 # =========================================================
@@ -793,7 +1051,8 @@ def create_post(
     ))
     conn.commit()
     cur.close()
-    conn.close()
+    release_connection(conn)
+    _load_posts_cached.clear()
 
 
 def toggle_like(post_id: int, user_id: int) -> None:
@@ -810,7 +1069,8 @@ def toggle_like(post_id: int, user_id: int) -> None:
         """, (post_id, user_id, now_str()))
     conn.commit()
     cur.close()
-    conn.close()
+    release_connection(conn)
+    _load_posts_cached.clear()
 
 
 def add_comment(post_id: int, user_id: int, content: str) -> None:
@@ -822,10 +1082,17 @@ def add_comment(post_id: int, user_id: int, content: str) -> None:
     """, (post_id, user_id, safe_text(content), now_str()))
     conn.commit()
     cur.close()
-    conn.close()
+    release_connection(conn)
+    _load_comments_cached.clear()
+    _load_posts_cached.clear()  # 댓글 수 표시가 갱신되도록 게시글 목록 캐시도 무효화
 
 
 def load_posts(board_type: str, include_pending: bool = False) -> pd.DataFrame:
+    return _load_posts_cached(board_type, include_pending)
+
+
+@st.cache_data(ttl=20)
+def _load_posts_cached(board_type: str, include_pending: bool) -> pd.DataFrame:
     conn = get_connection()
     base_query = """
     SELECT
@@ -865,11 +1132,16 @@ def load_posts(board_type: str, include_pending: bool = False) -> pd.DataFrame:
         base_query += " AND p.approval_status = 'approved' "
     base_query += " ORDER BY p.created_at DESC "
     df = pd.read_sql_query(base_query, conn, params=params)
-    conn.close()
+    release_connection(conn)
     return df
 
 
 def load_comments(post_id: int) -> pd.DataFrame:
+    return _load_comments_cached(post_id)
+
+
+@st.cache_data(ttl=20)
+def _load_comments_cached(post_id: int) -> pd.DataFrame:
     conn = get_connection()
     query = """
     SELECT
@@ -885,7 +1157,7 @@ def load_comments(post_id: int) -> pd.DataFrame:
     ORDER BY c.created_at ASC
     """
     df = pd.read_sql_query(query, conn, params=(post_id,))
-    conn.close()
+    release_connection(conn)
     return df
 
 
@@ -895,7 +1167,7 @@ def user_liked_post(post_id: int, user_id: int) -> bool:
     cur.execute("SELECT 1 FROM post_like WHERE post_id = %s AND user_id = %s", (post_id, user_id))
     found = cur.fetchone() is not None
     cur.close()
-    conn.close()
+    release_connection(conn)
     return found
 
 
@@ -927,10 +1199,16 @@ def send_report_message(
     ))
     conn.commit()
     cur.close()
-    conn.close()
+    release_connection(conn)
+    _load_received_messages_cached.clear()
 
 
 def load_received_messages(receiver_user_id: int) -> pd.DataFrame:
+    return _load_received_messages_cached(receiver_user_id)
+
+
+@st.cache_data(ttl=20)
+def _load_received_messages_cached(receiver_user_id: int) -> pd.DataFrame:
     conn = get_connection()
     query = """
     SELECT
@@ -950,7 +1228,7 @@ def load_received_messages(receiver_user_id: int) -> pd.DataFrame:
     ORDER BY m.created_at DESC
     """
     df = pd.read_sql_query(query, conn, params=(receiver_user_id,))
-    conn.close()
+    release_connection(conn)
     return df
 
 
@@ -1096,6 +1374,7 @@ def render_sidebar() -> None:
             st.rerun()
 
 
+@_fragment_decorator
 def render_general_public_community() -> None:
     st.subheader("공개 커뮤니티")
 
@@ -1146,6 +1425,7 @@ def render_general_public_community() -> None:
         )
 
 
+@_fragment_decorator
 def render_general_anonymous_write_only() -> None:
     st.subheader("익명 커뮤니티")
     st.caption("익명 커뮤니티 게시글은 관리자 승인 없이 바로 등록되며, 전문가만 열람 및 댓글 작성이 가능합니다.")
@@ -1201,6 +1481,7 @@ def render_general_anonymous_write_only() -> None:
         )
 
 
+@_fragment_decorator
 def render_general_inbox() -> None:
     st.subheader("보고서 수신함")
 
@@ -1227,6 +1508,7 @@ def render_general_inbox() -> None:
                 )
 
 
+@_fragment_decorator
 def render_senior_page() -> None:
     st.title("시니어 사용자")
     col1, col2 = st.columns(2)
@@ -1238,6 +1520,7 @@ def render_senior_page() -> None:
             st.info("추후 서비스 오픈 예정")
 
 
+@_fragment_decorator
 def render_expert_report_generator() -> None:
     st.subheader("보고서 생성")
 
@@ -1247,7 +1530,7 @@ def render_expert_report_generator() -> None:
         st.markdown("수검자 정보")
         examinee_name = st.text_input("이름", key="exp_examinee_name")
         date_of_birth = st.text_input("생년월일", key="exp_dob")
-        sex = st.selectbox("성별", options=["", "남", "여"], key="exp_sex")
+        sex = st.selectbox("성별", options=["", "남", "여", "기타"], key="exp_sex")
         examiner = st.text_input("검사자", value=st.session_state.get("nickname") or st.session_state.get("username"), key="exp_examiner")
         test_date = st.text_input("검사일", key="exp_test_date")
 
@@ -1396,6 +1679,7 @@ def render_expert_report_generator() -> None:
                 )
 
 
+@_fragment_decorator
 def render_expert_public_community() -> None:
     st.subheader("공개 커뮤니티")
     posts = load_posts("public", include_pending=False)
@@ -1414,6 +1698,7 @@ def render_expert_public_community() -> None:
         )
 
 
+@_fragment_decorator
 def render_expert_anonymous_comments() -> None:
     st.subheader("익명 커뮤니티")
     st.caption("익명 커뮤니티는 전문가만 열람 및 댓글 작성이 가능합니다.")
@@ -1434,6 +1719,7 @@ def render_expert_anonymous_comments() -> None:
         )
 
 
+@_fragment_decorator
 def render_expert_send_report() -> None:
     st.subheader("보고서 발송")
     st.caption("전문가 → 일반 이용자 발송만 허용됩니다.")
@@ -1524,16 +1810,18 @@ def render_general_page() -> None:
 
 def render_expert_page() -> None:
     st.title("전문가")
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["보고서 생성", "공개 커뮤니티", "익명 커뮤니티", "보고서 발송"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["보고서 생성", "누적 결과", "공개 커뮤니티", "익명 커뮤니티", "보고서 발송"]
     )
     with tab1:
         render_expert_report_generator()
     with tab2:
-        render_expert_public_community()
+        render_cumulative_dashboard()
     with tab3:
-        render_expert_anonymous_comments()
+        render_expert_public_community()
     with tab4:
+        render_expert_anonymous_comments()
+    with tab5:
         render_expert_send_report()
 
 
